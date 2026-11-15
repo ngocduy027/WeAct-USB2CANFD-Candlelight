@@ -1,0 +1,4 @@
+make: jobserver mkfifo: /tmp/GMfifo2: File exists
+/tmp/usb2can-led-multiboard/Candlelight
+   text	   data	    bss	    dec	    hex	filename
+  43740	    532	  21504	  65776	  100f0	/tmp/usb2can-led-multiboard/STM32G431_Candlelight2.5_Multiboard_0x26111501.elf

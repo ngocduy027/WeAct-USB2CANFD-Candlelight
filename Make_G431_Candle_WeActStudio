@@ -1,0 +1,26 @@
+
+# CANable Candlelight Makefile
+
+######################################
+#
+# This makefile compiles for the CANable board from 
+# WeActStudio which has a 16 MHz quartz
+#
+# Compile this by typing:
+# make -s -f Make_G431_Candle_WeActStudio
+#
+#######################################
+
+# TARGET_BOARD and TARGET_MCU: maximum 24 characters!
+
+TARGET_FIRMWARE = Candlelight
+TARGET_BOARD    = WeActStudio
+TARGET_MCU      = STM32G431xx
+
+# This board has a 16 MHz quartz.
+QUARTZ_FREQU    = 16000000
+
+# name of the compiled files (*.bin, *.hex, *.elf)
+TARGET_FILE = STM32G431_Candlelight2.5_WeActStudio
+
+include GCC_Rules.mk

@@ -1,0 +1,41 @@
+{
+  "version": "0x26111501",
+  "target": "WeAct USB2CANFD V2 / STM32G431CB / 128 KiB flash",
+  "flash_base": "0x08000000",
+  "user_flash_offset": "0x1c000",
+  "files": {
+    "bin": {
+      "name": "STM32G431_Candlelight2.5_WeActStudio_0x26111501.bin",
+      "bytes": 42868,
+      "sha256": "820827be2ec0fd100475f313f2fea9a6b18f32f2123ace6c4665f1cfcf4b06f5"
+    },
+    "hex": {
+      "name": "STM32G431_Candlelight2.5_WeActStudio_0x26111501.hex",
+      "bytes": 120547,
+      "sha256": "9fc3986ed5170a5f1e28ac77a276d9bae6730f1f5727de5cb93968e8d5b9bc31"
+    },
+    "elf": {
+      "name": "STM32G431_Candlelight2.5_WeActStudio_0x26111501.elf",
+      "bytes": 613456,
+      "sha256": "5aa352d23c2e7326038bc0ffa9effe2c627b1f4f51fd4d83f63f02fa2afd3ca1"
+    },
+    "map": {
+      "name": "STM32G431_Candlelight2.5_WeActStudio_0x26111501.map",
+      "bytes": 241144,
+      "sha256": "07c041f79599d32e63dc3050ddf2ab0bc955f85bdff5c35a2bb502debd40ace7"
+    }
+  },
+  "timestamp_resolution_us": 1,
+  "minimum_classic_bitrate": 5000,
+  "minimum_fd_nominal_bitrate": 20000,
+  "maximum_fd_data_bitrate": 5000000,
+  "usb_declared_ma": 250,
+  "power_measured": false,
+  "upstream_commit": "9a2121d2feca6d1fcec6f30312df9491b23b1204",
+  "native_test_count": 25,
+  "workspace_host_test_count": 254,
+  "hardware_flash_readback": "passed; candidate bytes and reserved user pages verified",
+  "hardware_loopback": "16 classic + 16 FD pairs passed after cold return on LED revision",
+  "visual_LED_confirmation": "not recorded",
+  "full_earlier_board_regressions": "0x261115 only; see docs/VALIDATION.md"
+}

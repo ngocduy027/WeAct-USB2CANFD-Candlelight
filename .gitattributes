@@ -1,0 +1,2 @@
+# Preserve vendor CP1252 content and mixed original line endings byte-for-byte.
+* -text

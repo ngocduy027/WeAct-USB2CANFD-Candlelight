@@ -1,0 +1,15 @@
+{
+  "source_inputs": 273,
+  "copied_compiled_source_and_build_files": "byte-identical to verified 0x26111501 source",
+  "documentation_only_adjustment": [
+    "Tests/README.md"
+  ],
+  "firmware_native_tests": 25,
+  "portable_tool_tests": 8,
+  "weact_rebuild": "BIN and HEX byte-identical to frozen release",
+  "firmware_bin_sha256": "820827be2ec0fd100475f313f2fea9a6b18f32f2123ace6c4665f1cfcf4b06f5",
+  "hardware_LED_release_flash": "passed full readback and classic/FD loopback; visual observation not recorded",
+  "portable_flash_tool": "offline tested; no USB execution performed by packaging session",
+  "excluded": "old Git histories, build/cache/IDE files, device backups/inventories/raw logs, old releases, unused board projects and Windows demo executables",
+  "remote": "not configured; user will push"
+}

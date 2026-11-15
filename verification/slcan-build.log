@@ -1,0 +1,4 @@
+make: jobserver mkfifo: /tmp/GMfifo2: File exists
+/tmp/usb2can-led-slcan/Slcan
+   text	   data	    bss	    dec	    hex	filename
+  41068	    340	  24168	  65576	  10028	/tmp/usb2can-led-slcan/STM32G431_Slcan2.5_Multiboard_0x26111501.elf

@@ -1,0 +1,860 @@
+/*
+    The MIT License
+    Implemenatation of USB GS Class (Geschwister Schneider)
+    Copyright (c) 2025 ElmueSoft / Hubert Denkmair
+    https://netcult.ch/elmue/CANable Firmware Update
+*/
+
+#include "usb_class.h"
+#include "usb_ctrlreq.h"
+#include "usb_core.h"
+#include "control.h"
+#include "frame_codec.h"
+#include "buffer.h"
+#include "usb_lowlevel.h"
+#include "system.h"
+#include "utils.h"
+#include "dfu.h"
+#include "can.h"
+
+#define EP_DATA_PACKET_SIZE         64                      // Data endpoints IN + OUT = max 64 byte
+#define DFU_INTERFACE_STR_IDX       (USBD_IDX_NEXT_STR + 0) // "Firmware Update Interface"
+#define CANDLE_INTERFACE_STR_1_IDX  (USBD_IDX_NEXT_STR + 1) // "CAN FD Interface 1"
+#define CANDLE_INTERFACE_STR_2_IDX  (USBD_IDX_NEXT_STR + 2) // "CAN FD Interface 2"
+#define CANDLE_INTERFACE_STR_3_IDX  (USBD_IDX_NEXT_STR + 3) // "CAN FD Interface 3"
+#define USBD_MS_OS_VENDOR_CODE      0x20                    // MS OS String: "MSFT100" + Vendor Code
+
+// calculate total size of Configuration descriptor
+#define USB_LEN_CANDLE_DESC         (USB_LEN_IF_DESC  + USB_LEN_EP_DESC * 2)
+#define USB_LEN_FIRMWARE_DESC       (USB_LEN_IF_DESC  + USB_LEN_DFU_DESC)
+#define USB_LEN_CONF_TOT_DESC       (USB_LEN_CFG_DESC + USB_LEN_CANDLE_DESC * CANDLE_INRERFACE_COUNT + USB_LEN_FIRMWARE_DESC)
+
+// calculate total size of MS OS Feature descriptor
+#define USB_LEN_FEATURE_DESC        16
+#define USB_LEN_WINUSB_DESC         24
+#define USB_LEN_MS_OS_TOT_DESC      (USB_LEN_FEATURE_DESC + USB_LEN_WINUSB_DESC * USBD_INTERFACES_COUNT)
+
+// The PMA Buffer has a size of 1024 bytes and starts with the BTABLE (Buffer Description Table)
+// For each single buffered endpoint 8 bytes are reserved in the BTABLE for IN or OUT or both.
+// For each double buffered endpoint 8 bytes are reserved in the BTABLE for only one direction: IN or OUT. Both is not possible!
+// See "STM32G4 Series - Chapter USB.pdf" --> page 6 in subfolder Documentation
+// See USB_ActivateEndpoint() --> PCD_SET_EP_TX_ADDRESS() and PCD_SET_EP_DBUF_ADDR()
+// Therefore: IN + OUT for Enpoints 0,1,2,3 is NOT possible here!
+// -----------------------------------
+// Endpoint 0 IN + OUT single = 8 byte
+// Endpoint 1 IN + --- single = 8 byte (4 byte unused)
+// Endpoint 2 -- + OUT single = 8 byte
+// Endpoint 3 IN + --- single = 8 byte (4 byte unused)
+// Endpoint 4 -- + OUT single = 8 byte
+// Endpoint 5 IN + --- single = 8 byte (4 byte unused)
+// Endpoint 6 -- + OUT single = 8 byte
+// Total:                      56 byte
+#define MAX_BTABLE_SIZE        56
+
+// ----- Globals
+extern USBD_HandleTypeDef    GLB_UsbDevice;
+extern eUserFlags            GLB_UserFlags[CHANNEL_COUNT];
+extern bool                  GLB_ProtoElmue;
+
+// ----- Constants
+// ATTENTION: Using the same endpoint number for IN and OUT (IN = 0x81 + OUT = 0x01) is not possible with double buffering.
+uint8_t EndpointsIN [] = { 0x81, 0x83, 0x85 };
+uint8_t EndpointsOUT[] = { 0x02, 0x04, 0x06 };
+
+// ----- Variables
+// reverse lookup table endpoint --> channel
+uint8_t EpToChannel[16] = {0};
+kDfuStatus DFU_Status   = {0};
+static volatile bool usb_ready;
+static volatile bool reset_pending;
+
+bool USBD_TrafficReady(void)
+{
+    return usb_ready && !reset_pending && GLB_UsbDevice.dev_state == USBD_STATE_CONFIGURED;
+}
+
+void USBD_RequestSessionReset(void)
+{
+    usb_ready = false;
+    reset_pending = true;
+}
+
+void USBD_CancelIn(int channel)
+{
+    if (channel < 0 || channel >= CANDLE_INRERFACE_COUNT) return;
+    uint32_t mask = system_irq_save();
+    PCD_HandleTypeDef *pcd = GLB_UsbDevice.pData;
+    uint8_t ep = EndpointsIN[channel] & 7;
+    if (GLB_UsbDevice.ep_in[ep].is_used) HAL_PCD_EP_Abort(pcd, EndpointsIN[channel]);
+    PCD_CLEAR_TX_EP_CTR(pcd->Instance, ep);
+    pcd->IN_ep[ep].xfer_buff = NULL;
+    pcd->IN_ep[ep].xfer_len = 0;
+    pcd->IN_ep[ep].xfer_count = 0;
+    buf_class *usb = buf_get_instance(channel);
+    usb->TxBusy = false;
+    usb->SendZLP = false;
+    system_irq_restore(mask);
+}
+
+// Cancel only a channel's staged/partial OUT record; preserve other legacy channels.
+void USBD_ChannelBoundary(int channel)
+{
+    int C = GLB_ProtoElmue ? channel : 0;
+    if (C < 0 || C >= CANDLE_INRERFACE_COUNT) return;
+    uint32_t mask = system_irq_save();
+    PCD_HandleTypeDef *pcd = GLB_UsbDevice.pData;
+    uint8_t ep = EndpointsOUT[C] & 7;
+    buf_class *usb = buf_get_instance(C);
+    uint32_t bytes = usb->RxPending ? usb->RxLength : pcd->OUT_ep[ep].xfer_count;
+    int owner = -1;
+    if (GLB_ProtoElmue) owner = C;
+    else if (bytes >= 10) owner = usb->from_host_buf[9];
+    else if ((PCD_GET_ENDPOINT(pcd->Instance, ep) & USB_EP_CTR_RX) &&
+             PCD_GET_EP_RX_CNT(pcd->Instance, ep) >= 10)
+    {
+        uint8_t header[10];
+        USB_ReadPMA(pcd->Instance, header, pcd->OUT_ep[ep].pmaadress, sizeof(header));
+        owner = header[9];
+    }
+    if (owner < 0 || owner == channel || owner >= CHANNEL_COUNT)
+    {
+        if (GLB_UsbDevice.ep_out[ep].is_used) HAL_PCD_EP_Abort(pcd, EndpointsOUT[C]);
+        PCD_CLEAR_RX_EP_CTR(pcd->Instance, ep);
+        usb->RxPending = false;
+        memset(usb->from_host_buf, 0, sizeof(usb->from_host_buf));
+        if (USBD_TrafficReady())
+            USBD_LL_PrepareReceive(&GLB_UsbDevice, EndpointsOUT[C], usb->from_host_buf,
+                                   sizeof(kHostFrameLegacy));
+    }
+    system_irq_restore(mask);
+}
+
+void USBD_ProtocolBoundary(void)
+{
+    uint32_t mask = system_irq_save();
+    PCD_HandleTypeDef *pcd = GLB_UsbDevice.pData;
+    for (int C = 0; C < CANDLE_INRERFACE_COUNT; ++C)
+    {
+        USBD_CancelIn(C);
+        HAL_PCD_EP_Abort(pcd, EndpointsOUT[C]);
+        PCD_CLEAR_RX_EP_CTR(pcd->Instance, EndpointsOUT[C] & 7);
+    }
+    buf_init();
+    for (int C = 0; C < CHANNEL_COUNT; ++C)
+    {
+        GLB_UserFlags[C] = USR_CandleDefault;
+        can_enable_busload(C, 0);
+    }
+    if (USBD_TrafficReady())
+        for (int C = 0; C < CANDLE_INRERFACE_COUNT; ++C)
+            USBD_LL_PrepareReceive(&GLB_UsbDevice, EndpointsOUT[C],
+                buf_get_instance(C)->from_host_buf, sizeof(kHostFrameLegacy));
+    system_irq_restore(mask);
+}
+
+void USBD_ProcessLifecycle(void)
+{
+    if (reset_pending)
+    {
+        uint32_t mask = system_irq_save();
+        reset_pending = false;
+        usb_ready = false;
+        system_irq_restore(mask);
+        // No main-loop frame is held here. USB ISRs only stage records or request resets.
+        can_close_all();
+        mask = system_irq_save();
+        for (int C = 0; C < CANDLE_INRERFACE_COUNT; ++C) USBD_CancelIn(C);
+        buf_init();
+        GLB_ProtoElmue = false;
+        for (int C = 0; C < CHANNEL_COUNT; ++C) GLB_UserFlags[C] = USR_CandleDefault;
+        usb_ready = !reset_pending && GLB_UsbDevice.dev_state == USBD_STATE_CONFIGURED;
+        if (usb_ready)
+            for (int C = 0; C < CANDLE_INRERFACE_COUNT; ++C)
+                USBD_LL_PrepareReceive(&GLB_UsbDevice, EndpointsOUT[C],
+                    buf_get_instance(C)->from_host_buf, sizeof(kHostFrameLegacy));
+        system_irq_restore(mask);
+    }
+    if (HAL_PCD_Is_Suspended()) can_suspend_all();
+    else can_resume_all();
+}
+
+void USBD_ProcessOut(void)
+{
+    if (!USBD_TrafficReady()) return;
+    for (int C = 0; C < CANDLE_INRERFACE_COUNT; ++C)
+    {
+        buf_class *usb = buf_get_instance(C);
+        if (!usb->RxPending) continue;
+        uint8_t channel = C;
+        kHostFrameLegacy decoded;
+        bool valid = !usb->RxOverflow && frame_decode_host(&decoded, usb->from_host_buf,
+            usb->RxLength, GLB_ProtoElmue, CHANNEL_COUNT, &channel);
+        bool echo_rejection = false;
+        if (!valid && !GLB_ProtoElmue && usb->RxLength >= 12)
+        {
+            // A malformed legacy request may still own a host TX context.
+            const kHostFrameLegacy *raw = (const void *)usb->from_host_buf;
+            if (raw->channel < CHANNEL_COUNT && raw->echo_id != ECHO_RxData)
+            {
+                memset(&decoded, 0, sizeof(decoded));
+                memcpy(&decoded, raw, MIN(usb->RxLength, sizeof(decoded)));
+                decoded.flags &= FRM_FDF;
+                decoded.can_dlc = MIN(decoded.can_dlc, 15);
+                channel = raw->channel;
+                echo_rejection = true;
+            }
+        }
+        if (valid || echo_rejection)
+        {
+            buf_class *can = buf_get_instance(channel);
+            kHostFrameObject *obj = buf_get_frame_locked(&can->list_can_pool);
+            if (!obj) continue; // Keep this record staged; endpoint remains NAKed.
+            obj->frame = decoded;
+            obj->rejected = !valid;
+            list_add_tail_locked(&obj->list, &can->list_to_can);
+        }
+        else error_assert(C, APP_CanTxFail, true);
+        uint32_t mask = system_irq_save();
+        usb->RxPending = false;
+        memset(usb->from_host_buf, 0, sizeof(usb->from_host_buf));
+        if (USBD_TrafficReady())
+            USBD_LL_PrepareReceive(&GLB_UsbDevice, EndpointsOUT[C], usb->from_host_buf,
+                                   sizeof(kHostFrameLegacy));
+        system_irq_restore(mask);
+    }
+}
+
+void USBD_EndpointClearHalt(uint8_t address)
+{
+    int channel = EpToChannel[address & 7];
+    if (channel >= CANDLE_INRERFACE_COUNT) return;
+    uint32_t mask = system_irq_save();
+    if (address & 0x80)
+        USBD_CancelIn(channel); // Retain in_flight for replay by the main loop.
+    else if (!buf_get_instance(channel)->RxPending && USBD_TrafficReady())
+        USBD_LL_PrepareReceive(&GLB_UsbDevice, address,
+            buf_get_instance(channel)->from_host_buf, sizeof(kHostFrameLegacy));
+    else
+        // Clear-stall makes OUT VALID in the HAL. Restore NAK while a staged
+        // record owns the buffer, or while lifecycle teardown is pending.
+        HAL_PCD_EP_Abort(GLB_UsbDevice.pData, address);
+    system_irq_restore(mask);
+}
+
+
+// SET_INTERFACE(alt 0): synchronize toggles while preserving the CAN session,
+// staged OUT ownership and the replayable IN object.
+void USBD_InterfaceReset(uint8_t interface)
+{
+    if (interface == DFU_INTERFACE_NUMBER) return;
+    unsigned channel = interface == 0 ? 0U : (unsigned)interface - 1U;
+    if (channel >= CANDLE_INRERFACE_COUNT) return;
+    USBD_LL_ClearStallEP(&GLB_UsbDevice, EndpointsIN[channel]);
+    USBD_EndpointClearHalt(EndpointsIN[channel]);
+    USBD_LL_ClearStallEP(&GLB_UsbDevice, EndpointsOUT[channel]);
+    USBD_EndpointClearHalt(EndpointsOUT[channel]);
+}
+
+uint8_t  USBD_GS_Init       (USBD_HandleTypeDef *pdev, uint8_t cfgidx);
+uint8_t  USBD_GS_DeInit     (USBD_HandleTypeDef *pdev, uint8_t cfgidx);
+uint8_t  USBD_GS_Setup      (USBD_HandleTypeDef *pdev, USBD_SetupReqTypedef *req);
+uint8_t  USBD_GS_EP0_RxReady(USBD_HandleTypeDef *pdev);
+uint8_t  USBD_GS_DataIn     (USBD_HandleTypeDef *pdev, uint8_t epnum);
+uint8_t  USBD_GS_DataOut    (USBD_HandleTypeDef *pdev, uint8_t epnum);
+// -------------
+uint8_t  USBD_GS_Vendor_Request(USBD_HandleTypeDef *pdev, USBD_SetupReqTypedef *req);
+bool     USBD_GS_DFU_Request   (USBD_HandleTypeDef *pdev, USBD_SetupReqTypedef *req);
+bool     USBD_GS_CustomRequest (USBD_HandleTypeDef *pdev, USBD_SetupReqTypedef *req);
+
+// WinUSB class callbacks structure
+// These functions are all called over usb_core and usb_lowlevel from PCD_EP_ISR_Handler() interrupts
+USBD_ClassTypeDef USBD_ClassCallbacks =
+{
+    .Init              = USBD_GS_Init,
+    .DeInit            = USBD_GS_DeInit,
+    .Setup             = USBD_GS_Setup,
+    .EP0_TxSent        = NULL,
+    .EP0_RxReady       = USBD_GS_EP0_RxReady,
+    .DataIn            = USBD_GS_DataIn,
+    .DataOut           = USBD_GS_DataOut,
+    .SOF               = NULL,
+    .IsoINIncomplete   = NULL, // ISO endpoints not used
+    .IsoOUTIncomplete  = NULL, // ISO endpoints not used
+};
+
+#define USB_FIRMWARE_DATE_BCD ((FIRMWARE_VERSION_BCD > 0xFFFFFFU) ? (FIRMWARE_VERSION_BCD >> 8) : FIRMWARE_VERSION_BCD)
+
+// Device descriptor Candlelight
+__ALIGN_BEGIN uint8_t USBD_DeviceDesc[] __ALIGN_END =
+{
+    USB_LEN_DEV_DESC,                  // bLength = 18 byte
+    USB_DESC_TYPE_DEVICE,              // bDescriptorType = Device Descriptor
+    0x00,                              // bcdUSB version
+    0x02,                              // bcdUSB version  = 2.0
+    0x00,                              // bDeviceClass    = Class info in interface descriptors
+    0x00,                              // bDeviceSubClass
+    0x00,                              // bDeviceProtocol
+    USB_MAX_EP0_SIZE,                  // bMaxPacketSize  = 64 bytes
+    LOBYTE(0x1D50),                    // idVendor  OpenMoko
+    HIBYTE(0x1D50),                    // idVendor  OpenMoko
+    LOBYTE(0x606F),                    // idProduct CANable Candlelight
+    HIBYTE(0x606F),                    // idProduct CANable Candlelight
+    LOBYTE(USB_FIRMWARE_DATE_BCD >> 8), // bcdDevice firmware version (month)
+    HIBYTE(USB_FIRMWARE_DATE_BCD >> 8), // bcdDevice firmware version (year)
+    USBD_IDX_MFC_STR,                  // Index of manufacturer  string
+    USBD_IDX_PRODUCT_STR,              // Index of product string
+    USBD_IDX_SERIAL_STR,               // Index of serial number string
+    USBD_CONFIGURATIONS_COUNT          // bNumConfigurations
+};
+
+// Configuration Descriptor Candlelight
+__ALIGN_BEGIN uint8_t USBD_ConfigDescFS[] __ALIGN_END =
+{
+    // ------ Configuration Descriptor ------
+    // length = USB_LEN_CFG_DESC:
+    USB_LEN_CFG_DESC,                 // bLength = 9 byte
+    USB_DESC_TYPE_CONFIGURATION,      // bDescriptorType: Configuration
+    USB_LEN_CONF_TOT_DESC,            // wTotalLength
+    0x00,
+    USBD_INTERFACES_COUNT,            // bNumInterfaces: 2, 3 or 4 interfaces
+    0x01,                             // bConfigurationValue
+    0x00,                             // iConfiguration (String not used)
+    0x80 | USBD_SELF_POWERED,         // bmAttributes
+    USB_MAX_POWER_MA / 2,              // bMaxPower uses units of 2 mA
+
+    // ========================= CANDLELIGHT 1 ==========================
+
+    // ------ Interface descriptor ------
+    // length = USB_LEN_CANDLE_DESC:
+    USB_LEN_IF_DESC,                  // bLength = 9 byte
+    USB_DESC_TYPE_INTERFACE,          // bDescriptorType: Interface
+    0,                                // bInterfaceNumber: 0
+    0x00,                             // bAlternateSetting
+    0x02,                             // bNumEndpoints
+    0xFF,                             // bInterfaceClass:    Vendor Specific
+    0xFF,                             // bInterfaceSubClass: Vendor Specific
+    0xFF,                             // bInterfaceProtocol: Vendor Specific
+    CANDLE_INTERFACE_STR_1_IDX,       // iInterface
+
+    // ----- Endpoint IN descriptor ------
+    USB_LEN_EP_DESC,                  // bLength = 7 byte
+    USB_DESC_TYPE_ENDPOINT,           // bDescriptorType: Endpoint
+    0x81,                             // bEndpointAddress
+    0x02,                             // bmAttributes: bulk
+    LOBYTE(EP_DATA_PACKET_SIZE),      // wMaxPacketSize
+    HIBYTE(EP_DATA_PACKET_SIZE),
+    0x00,                             // bInterval
+
+    // ----- Endpoint OUT descriptor ------
+    USB_LEN_EP_DESC,                  // bLength = 7 byte
+    USB_DESC_TYPE_ENDPOINT,           // bDescriptorType: Endpoint
+    0x02,                             // bEndpointAddress
+    0x02,                             // bmAttributes: bulk
+    LOBYTE(EP_DATA_PACKET_SIZE),      // wMaxPacketSize
+    HIBYTE(EP_DATA_PACKET_SIZE),
+    0x00,                             // bInterval
+
+    // ======================== FIRMWARE UPDATE =========================
+
+    // ------ DFU Interface descriptor ------
+    // length = USB_LEN_FIRMWARE_DESC:
+    USB_LEN_IF_DESC,                  // bLength = 9 byte
+    USB_DESC_TYPE_INTERFACE,          // bDescriptorType: Interface
+    DFU_INTERFACE_NUMBER,             // bInterfaceNumber: 1
+    0x00,                             // bAlternateSetting
+    0x00,                             // bNumEndpoints
+    0xFE,                             // bInterfaceClass: Vendor Specific
+    0x01,                             // bInterfaceSubClass
+    0x01,                             // bInterfaceProtocol : Runtime mode
+    DFU_INTERFACE_STR_IDX,            // iInterface
+
+    // ------ DFU Functional descriptor ------
+    USB_LEN_DFU_DESC,                 // bLength = 9 byte
+    0x21,                             // bDescriptorType: DFU FUNCTIONAL
+    0x0B,                             // bmAttributes: detach, upload, download
+    0xFF, 0x00,                       // wDetachTimeOut
+    0x00, 0x08,                       // wTransferSize
+    0x1a, 0x01,                       // bcdDFUVersion: 1.1a
+
+#if CANDLE_INRERFACE_COUNT > 1
+
+    // ========================= CANDLELIGHT 2 ==========================
+
+    // ------ Interface descriptor ------
+    // length = USB_LEN_CANDLE_DESC:
+    USB_LEN_IF_DESC,                  // bLength = 9 byte
+    USB_DESC_TYPE_INTERFACE,          // bDescriptorType: Interface
+    2,                                // bInterfaceNumber: 2
+    0x00,                             // bAlternateSetting
+    0x02,                             // bNumEndpoints
+    0xFF,                             // bInterfaceClass:    Vendor Specific
+    0xFF,                             // bInterfaceSubClass: Vendor Specific
+    0xFF,                             // bInterfaceProtocol: Vendor Specific
+    CANDLE_INTERFACE_STR_2_IDX,       // iInterface
+
+    // ----- Endpoint IN descriptor ------
+    USB_LEN_EP_DESC,                  // bLength = 7 byte
+    USB_DESC_TYPE_ENDPOINT,           // bDescriptorType: Endpoint
+    0x83,                             // bEndpointAddress
+    0x02,                             // bmAttributes: bulk
+    LOBYTE(EP_DATA_PACKET_SIZE),      // wMaxPacketSize
+    HIBYTE(EP_DATA_PACKET_SIZE),
+    0x00,                             // bInterval
+
+    // ----- Endpoint OUT descriptor ------
+    USB_LEN_EP_DESC,                  // bLength = 7 byte
+    USB_DESC_TYPE_ENDPOINT,           // bDescriptorType: Endpoint
+    0x04,                             // bEndpointAddress
+    0x02,                             // bmAttributes: bulk
+    LOBYTE(EP_DATA_PACKET_SIZE),      // wMaxPacketSize
+    HIBYTE(EP_DATA_PACKET_SIZE),
+    0x00,                             // bInterval
+
+#endif
+
+#if CANDLE_INRERFACE_COUNT > 2
+
+    // ========================= CANDLELIGHT 3 ==========================
+
+    // ------ Interface descriptor ------
+    // length = USB_LEN_CANDLE_DESC:
+    USB_LEN_IF_DESC,                  // bLength = 9 byte
+    USB_DESC_TYPE_INTERFACE,          // bDescriptorType: Interface
+    3,                                // bInterfaceNumber: 3
+    0x00,                             // bAlternateSetting
+    0x02,                             // bNumEndpoints
+    0xFF,                             // bInterfaceClass:    Vendor Specific
+    0xFF,                             // bInterfaceSubClass: Vendor Specific
+    0xFF,                             // bInterfaceProtocol: Vendor Specific
+    CANDLE_INTERFACE_STR_3_IDX,       // iInterface
+
+    // ----- Endpoint IN descriptor ------
+    USB_LEN_EP_DESC,                  // bLength = 7 byte
+    USB_DESC_TYPE_ENDPOINT,           // bDescriptorType: Endpoint
+    0x85,                             // bEndpointAddress
+    0x02,                             // bmAttributes: bulk
+    LOBYTE(EP_DATA_PACKET_SIZE),      // wMaxPacketSize
+    HIBYTE(EP_DATA_PACKET_SIZE),
+    0x00,                             // bInterval
+
+    // ----- Endpoint OUT descriptor ------
+    USB_LEN_EP_DESC,                  // bLength = 7 byte
+    USB_DESC_TYPE_ENDPOINT,           // bDescriptorType: Endpoint
+    0x06,                             // bEndpointAddress
+    0x02,                             // bmAttributes: bulk
+    LOBYTE(EP_DATA_PACKET_SIZE),      // wMaxPacketSize
+    HIBYTE(EP_DATA_PACKET_SIZE),
+    0x00,                             // bInterval
+
+#endif
+};
+
+//  Microsoft Compatible ID Feature Descriptor
+__ALIGN_BEGIN uint8_t USBD_MicrosoftFeatureDescr[] __ALIGN_END =
+{
+    // length = USB_LEN_FEATURE_DESC:
+    LOBYTE(USB_LEN_MS_OS_TOT_DESC),   // length 0
+    HIBYTE(USB_LEN_MS_OS_TOT_DESC),   // length 1
+    0x00,                             // length 2
+    0x00,                             // length 3
+    0x00, 0x01,                       // version 1.0
+    0x04, 0x00,                       // descr index (0x0004)
+    USBD_INTERFACES_COUNT,            // number of sections (2, 3 or 4)
+    0x00, 0x00, 0x00, 0x00,           // reserved
+    0x00, 0x00, 0x00,
+    // ------------------------
+    // length = USB_LEN_WINUSB_DESC:
+    0x00,                             // interface number: 0 = Candlelight 1
+    0x01,                             // reserved - 1 byte
+    0x57, 0x49, 0x4E, 0x55,           // compatible ID ("WINUSB\0\0") - 8 bytes
+    0x53, 0x42, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00,           // sub-compatible ID - 8 bytes
+    0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00,           // reserved - 6 bytes
+    0x00, 0x00,
+    // ------------------------
+    // length = USB_LEN_WINUSB_DESC:
+    DFU_INTERFACE_NUMBER,             // interface number: 1 = DFU
+    0x01,                             // reserved - 1 byte
+    0x57, 0x49, 0x4E, 0x55,           // compatible ID ("WINUSB\0\0") - 8 bytes
+    0x53, 0x42, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00,           // sub-compatible ID - 8 bytes
+    0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00,           // reserved - 6 bytes
+    0x00, 0x00,
+#if CANDLE_INRERFACE_COUNT > 1
+    // length = USB_LEN_WINUSB_DESC:
+    0x02,                             // interface number: 2 = Candlelight 2
+    0x01,                             // reserved - 1 byte
+    0x57, 0x49, 0x4E, 0x55,           // compatible ID ("WINUSB\0\0") - 8 bytes
+    0x53, 0x42, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00,           // sub-compatible ID - 8 bytes
+    0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00,           // reserved - 6 bytes
+    0x00, 0x00,
+#endif
+#if CANDLE_INRERFACE_COUNT > 2
+    // length = USB_LEN_WINUSB_DESC:
+    0x03,                             // interface number: 3 = Candlelight 3
+    0x01,                             // reserved - 1 byte
+    0x57, 0x49, 0x4E, 0x55,           // compatible ID ("WINUSB\0\0") - 8 bytes
+    0x53, 0x42, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00,           // sub-compatible ID - 8 bytes
+    0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00,           // reserved - 6 bytes
+    0x00, 0x00,
+#endif
+};
+
+// Microsoft Extended Properties Descriptor
+__ALIGN_BEGIN uint8_t USBD_MicrosoftExtPropertyDescr[] __ALIGN_END =
+{
+    0x92, 0x00, 0x00, 0x00, // length
+    0x00, 0x01,             // version 1.0
+    0x05, 0x00,             // descr index (0x0005)
+    0x01, 0x00,             // number of sections
+    0x88, 0x00, 0x00, 0x00, // property section size
+    0x07, 0x00, 0x00, 0x00, // property data type 7: Unicode REG_MULTI_SZ
+    0x2a, 0x00,             // property name length
+
+    0x44, 0x00, 0x65, 0x00, // property name "DeviceInterfaceGUIDs"
+    0x76, 0x00, 0x69, 0x00,
+    0x63, 0x00, 0x65, 0x00,
+    0x49, 0x00, 0x6e, 0x00,
+    0x74, 0x00, 0x65, 0x00,
+    0x72, 0x00, 0x66, 0x00,
+    0x61, 0x00, 0x63, 0x00,
+    0x65, 0x00, 0x47, 0x00,
+    0x55, 0x00, 0x49, 0x00,
+    0x44, 0x00, 0x73, 0x00,
+    0x00, 0x00,
+
+    0x50, 0x00, 0x00, 0x00, // property data length
+
+    0x7b, 0x00, 0x63, 0x00, // property name: "{c15b4308-04d3-11e6-b3ea-6057189e6443}\0\0" == Unique Candlelight GUID
+    0x31, 0x00, // <----- This '1' at offset 70 will be replaced with a '2' for the DFU interface
+    0x35, 0x00,
+    0x62, 0x00, 0x34, 0x00,
+    0x33, 0x00, 0x30, 0x00,
+    0x38, 0x00, 0x2d, 0x00,
+    0x30, 0x00, 0x34, 0x00,
+    0x64, 0x00, 0x33, 0x00,
+    0x2d, 0x00, 0x31, 0x00,
+    0x31, 0x00, 0x65, 0x00,
+    0x36, 0x00, 0x2d, 0x00,
+    0x62, 0x00, 0x33, 0x00,
+    0x65, 0x00, 0x61, 0x00,
+    0x2d, 0x00, 0x36, 0x00,
+    0x30, 0x00, 0x35, 0x00,
+    0x37, 0x00, 0x31, 0x00,
+    0x38, 0x00, 0x39, 0x00,
+    0x65, 0x00, 0x36, 0x00,
+    0x34, 0x00, 0x34, 0x00,
+    0x33, 0x00, 0x7d, 0x00,
+    0x00, 0x00, 0x00, 0x00
+};
+
+// =========================================================================================================
+
+// Configue Packet Memory Area (PMA) for all endpoints
+// Called from USBD_LL_Init() during initialization
+USBD_StatusTypeDef USBD_ConfigureEndpoints(USBD_HandleTypeDef *pdev)
+{
+    PCD_HandleTypeDef* hpcd = (PCD_HandleTypeDef*)pdev->pData;
+    uint32_t addr = MAX_BTABLE_SIZE;
+
+    if (!USBD_LL_ConfigurePMA(hpcd, 0x00, false, &addr, USB_MAX_EP0_SIZE) || // EP 0 OUT
+        !USBD_LL_ConfigurePMA(hpcd, 0x80, false, &addr, USB_MAX_EP0_SIZE))   // EP 0 IN
+        return USBD_FAIL; // PMA buffer overflow
+
+    for (uint8_t C=0; C<CANDLE_INRERFACE_COUNT; C++)
+    {
+        if (!USBD_LL_ConfigurePMA(hpcd, EndpointsIN [C], false, &addr, EP_DATA_PACKET_SIZE) || // EP 1,3,5 IN
+            !USBD_LL_ConfigurePMA(hpcd, EndpointsOUT[C], false, &addr, EP_DATA_PACKET_SIZE))   // EP 2,4,6 OUT, single buffered for main-loop backpressure
+            return USBD_FAIL; // PMA buffer overflow
+    }
+    return USBD_OK;
+}
+
+// =========================================================================================================
+
+// interrupt callback
+uint8_t USBD_GS_Init(USBD_HandleTypeDef *pdev, uint8_t cfgidx)
+{
+    USBD_RequestSessionReset();
+    pdev->pClassData = &GLB_UsbDevice; // dummy, not used here, but required for usb_core.c
+
+    // Initialize the default response to DFU_RequGetStatus request
+    DFU_Status.Status    = DfuStatus_OK;     // no error
+    DFU_Status.State     = DfuState_AppIdle; // in application mode and idle
+    DFU_Status.StringIdx = 0xFF;             // no string descriptor available
+
+    for (uint8_t C=0; C<CANDLE_INRERFACE_COUNT; C++)
+    {
+        buf_class* inst = buf_get_instance(C);
+        inst->RxPending = false;
+
+        // fill reverse lookup table: endpoint --> channel
+        EpToChannel[EndpointsIN [C] & 0xF] = C; // 0x81 --> 0, 0x83 --> 1, 0x85 --> 2
+        EpToChannel[EndpointsOUT[C] & 0xF] = C; // 0x02 --> 0, 0x04 --> 1, 0x06 --> 2
+
+        USBD_LL_OpenEP(pdev, EndpointsIN [C], USBD_EP_TYPE_BULK, EP_DATA_PACKET_SIZE);
+        USBD_LL_OpenEP(pdev, EndpointsOUT[C], USBD_EP_TYPE_BULK, EP_DATA_PACKET_SIZE);
+
+        // Main-loop session teardown completes before OUT reception is armed.
+    }
+    return USBD_OK;
+}
+
+// interrupt callback
+uint8_t USBD_GS_DeInit(USBD_HandleTypeDef *pdev, uint8_t cfgidx)
+{
+    USBD_RequestSessionReset();
+    for (uint8_t C=0; C<CANDLE_INRERFACE_COUNT; C++)
+    {
+        USBD_LL_CloseEP(pdev, EndpointsIN [C]);
+        USBD_LL_CloseEP(pdev, EndpointsOUT[C]);
+    }
+    return USBD_OK;
+}
+
+// interrupt callback
+// A SETUP request has been received
+// Return the actual handling status to the USB request dispatcher.
+uint8_t USBD_GS_Setup(USBD_HandleTypeDef *pdev, USBD_SetupReqTypedef *req)
+{
+    uint8_t type = req->bRequestType & USB_REQ_TYPE_MASK;
+    if (type == USB_REQ_TYPE_CLASS || type == USB_REQ_TYPE_VENDOR)
+        return USBD_GS_Vendor_Request(pdev, req);
+    USBD_CtlError(pdev, req);
+    return USBD_FAIL;
+}
+
+uint8_t USBD_GS_Vendor_Request(USBD_HandleTypeDef *pdev, USBD_SetupReqTypedef *req)
+{
+    uint8_t recipient = req->bRequestType & USB_REQ_RECIPIENT_MASK;
+    bool handled = false;
+    if ((recipient == USB_REQ_RECIPIENT_DEVICE || recipient == USB_REQ_RECIPIENT_INTERFACE) &&
+        req->wIndex < USBD_INTERFACES_COUNT)
+    {
+        if (req->wIndex == DFU_INTERFACE_NUMBER)
+            handled = USBD_GS_DFU_Request(pdev, req);
+        else if ((req->bRequestType & USB_REQ_TYPE_MASK) == USB_REQ_TYPE_VENDOR)
+            handled = control_setup_request(pdev, req);
+    }
+    if (handled) return USBD_OK;
+    USBD_CtlError(pdev, req);
+    return USBD_FAIL;
+}
+
+// interrupt callback
+// Second stage of SETUP requests with OUT data
+// USBD_BUSY defers the EP0 status stage until the main loop executes the command.
+// IMPORTANT: Read comment of control_setup_OUT_data() !!!
+uint8_t USBD_GS_EP0_RxReady(USBD_HandleTypeDef *pdev)
+{
+    control_setup_OUT_data(pdev);
+    return USBD_BUSY; // Main loop completes or stalls the status stage.
+}
+
+// called from inside an interrupt callback
+// request has destination to interface 1 (firmware update)
+bool USBD_GS_DFU_Request(USBD_HandleTypeDef *pdev, USBD_SetupReqTypedef *req)
+{
+    if ((req->bRequestType & USB_REQ_RECIPIENT_MASK) != USB_REQ_RECIPIENT_INTERFACE ||
+        (req->bRequestType & USB_REQ_TYPE_MASK)      != USB_REQ_TYPE_CLASS)
+        return false; // stall endpoint 0
+
+    switch (req->bRequest)
+    {
+        case DFU_RequDetach:
+            if ((req->bRequestType & USB_REQ_DIRECTION_MASK) != USB_REQ_DIRECTION_OUT || req->wLength != 0)
+                return false;
+            if (dfu_switch_to_bootloader() != FBK_Success) return false;
+            DFU_Status.State = DfuState_AppDetach;
+            return true;
+        case DFU_RequGetStatus:
+            if ((req->bRequestType & USB_REQ_DIRECTION_MASK) != USB_REQ_DIRECTION_IN || req->wLength == 0)
+                return false;
+            USBD_CtlSendData(pdev, (uint8_t *)&DFU_Status, MIN(req->wLength, sizeof(DFU_Status)));
+            return true;
+
+        default:
+            return false; // stall endpoint 0
+    }
+}
+
+// interrupt callback
+// host data has arrived on the USB OUT endpoint (0x02, 0x04, 0x06)
+uint8_t USBD_GS_DataOut(USBD_HandleTypeDef *pdev, uint8_t epnum)
+{
+    uint8_t C = EpToChannel[epnum & 7];
+    if (C >= CANDLE_INRERFACE_COUNT) return USBD_FAIL;
+    buf_class *usb = buf_get_instance(C);
+    PCD_HandleTypeDef *pcd = pdev->pData;
+    usb->RxLength = (uint16_t)USBD_LL_GetRxDataSize(pdev, epnum);
+    usb->RxOverflow = pcd->OUT_ep[epnum & 7].xfer_overflow != 0;
+    usb->RxPending = true;
+    // Single-buffer endpoint stays NAKed until main has taken ownership.
+    return USBD_OK;
+}
+
+// interrupt callback
+// get a Unicode string for the given string index that comes from the descriptors
+uint8_t* USBD_GetUserStringDescr(USBD_HandleTypeDef *pdev, uint8_t index, uint16_t *length)
+{
+    switch (index)
+    {
+        case CANDLE_INTERFACE_STR_1_IDX:
+        case CANDLE_INTERFACE_STR_2_IDX:
+        case CANDLE_INTERFACE_STR_3_IDX:
+        {
+            // The interface name is important: Windows displays it while the driver is installed.
+            // Do not display a stupid abbreviation like "gs_usb" that an ordinary computer user will not understand.
+#if CANDLE_INRERFACE_COUNT > 1
+            uint8_t* unicode = USBD_GetStringDescr("CAN FD Interface x", length);
+            unicode[36] = ('1' - CANDLE_INTERFACE_STR_1_IDX) + index; // replace the 'x' with '1', '2', '3'
+            return unicode;
+#else
+            return USBD_GetStringDescr("CAN FD Interface", length);
+#endif
+        }
+        // This name is important: Windows displays it while the driver is installed.
+        case DFU_INTERFACE_STR_IDX:
+            return USBD_GetStringDescr("Firmware Update Interface", length);
+
+        case 0xEE: // Microsoft OS String Descriptor Request --> "MSFT100" + Vendor Code
+        {
+            uint8_t* unicode = USBD_GetStringDescr("MSFT100x", length);
+            unicode[16] = USBD_MS_OS_VENDOR_CODE; // replace the 'x' with the vendor code
+            return unicode;
+        }
+        default:
+            return NULL;
+    }
+}
+
+// =========================================================================================================
+
+// Called from interrupt handler PCD_EP_ISR_Handler --> HAL_PCD_SetupStageCallback
+// return true if request was handled
+bool USBD_SetupStageRequest(PCD_HandleTypeDef *hpcd)
+{
+    USBD_HandleTypeDef *pdev = (USBD_HandleTypeDef*)hpcd->pData;
+    USBD_ParseSetupRequest((USBD_SetupReqTypedef*)&pdev->request, (uint8_t*)hpcd->Setup);
+    pdev->ep0_state = USBD_EP0_SETUP;
+    pdev->ep0_data_len = pdev->request.wLength;
+
+    switch (pdev->request.bRequestType & USB_REQ_RECIPIENT_MASK)
+    {
+        case USB_REQ_RECIPIENT_DEVICE:    // device request
+        case USB_REQ_RECIPIENT_INTERFACE: // interface request
+            return USBD_GS_CustomRequest(pdev, &pdev->request);
+        default:
+            return false;
+    }
+}
+
+// Called from interrupt handler
+// Handle Microsoft OS SETUP requests (required for automatic driver installation on Windows)
+// Windows sends an interface request, but for testing with WinUSB it is required that also a device request is answered the same way.
+// For details read: https://netcult.ch/elmue/CANable Firmware Update
+// return true if request was handled
+bool USBD_GS_CustomRequest(USBD_HandleTypeDef *pdev, USBD_SetupReqTypedef *req)
+{
+    if (req->bRequest != USBD_MS_OS_VENDOR_CODE || req->wValue >= USBD_INTERFACES_COUNT ||
+        (req->bRequestType & USB_REQ_TYPE_MASK) != USB_REQ_TYPE_VENDOR ||
+        (req->bRequestType & USB_REQ_DIRECTION_MASK) != USB_REQ_DIRECTION_IN || req->wLength == 0)
+        return false;
+
+    switch (req->wIndex) // wIndex = requested descriptor type
+    {
+        case 4: // Microsoft OS Feature Request
+            USBD_CtlSendData(pdev, USBD_MicrosoftFeatureDescr, MIN(sizeof(USBD_MicrosoftFeatureDescr), req->wLength));
+            return true;
+
+        case 5: // Microsoft OS Extended Properties Request
+        {
+            // IMPORTANT: In the legacy firmware it was wrong to return only a GUID for interface 0.
+            // If no GUID is returned for the DFU interface, Windows will not install the WinUSB driver
+            // and the Firmware Updater cannot switch the CANable into DFU mode!
+            // for Candlelight     interface return GUID "{c15b4308-04d3-11e6-b3ea-6057189e6443}"
+            // for Firmware Update interface return GUID "{c25b4308-04d3-11e6-b3ea-6057189e6443}"
+
+            // Responses longer than EP0 maxpacket need persistent storage for later IN packets.
+            uint8_t* buf = USBD_GetStringDescr(NULL, NULL);
+            memcpy(buf, USBD_MicrosoftExtPropertyDescr, sizeof(USBD_MicrosoftExtPropertyDescr));
+            if (req->wValue == DFU_INTERFACE_NUMBER)
+                buf[70] = '2';
+
+            USBD_CtlSendData(pdev, buf, MIN(sizeof(USBD_MicrosoftExtPropertyDescr), req->wLength));
+            return true;
+        }
+    }
+    return false;
+}
+
+// ==================================== IN Transfer ==========================================
+
+// This function is called from the main loop only after usb_buf->TxBusy == false.
+// Send a frame to the host on IN endpoint, either kHostFrameLegacy or kHeader
+void USBD_SendFrameToHost(int channel, void* frame)
+{
+    if (!GLB_ProtoElmue) channel = 0;
+    if (channel < 0 || channel >= CANDLE_INRERFACE_COUNT) return;
+    uint16_t length;
+    if (GLB_ProtoElmue) length = ((kHeader *)frame)->size;
+    else
+    {
+        kHostFrameLegacy *legacy = frame;
+        if (legacy->channel >= CHANNEL_COUNT) return;
+        length = (legacy->flags & FRM_FDF) ? 80 : 24;
+        if (!(GLB_UserFlags[legacy->channel] & USR_Timestamp)) length -= 4;
+    }
+    buf_class *usb = buf_get_instance(channel);
+    if (!length || length > sizeof(usb->to_host_buf)) return;
+    uint32_t mask = system_irq_save();
+    if (USBD_TrafficReady() && !usb->TxBusy &&
+        !USBD_LL_IsStallEP(&GLB_UsbDevice, EndpointsIN[channel]))
+    {
+        memcpy(usb->to_host_buf, frame, length);
+        usb->TxBusy = true;
+        usb->SendZLP = length % EP_DATA_PACKET_SIZE == 0;
+        if (USBD_LL_Transmit(&GLB_UsbDevice, EndpointsIN[channel], usb->to_host_buf, length) != USBD_OK)
+        {
+            usb->TxBusy = false;
+            usb->SendZLP = false;
+        }
+    }
+    system_irq_restore(mask);
+}
+
+// interrupt callback
+// The data from USBD_SendFrameToHost() has been sent to the host on IN endpoint (0x81, 0x83, 0x85)
+uint8_t USBD_GS_DataIn(USBD_HandleTypeDef *pdev, uint8_t epnum)
+{
+    int channel = EpToChannel[epnum & 0xF]; // epnum = 0x81 --> channel 0, 0x83 --> 1, 0x85 --> 2
+    buf_class* usb_buf = buf_get_instance(channel);
+
+    // This important code was missing in the legacy firmware. (fixed by ElmSüoft)
+    // After sending exactly 64 bytes a zero length packet (ZLP) must follow.
+    // Read "Excellent USB Tutorial.chm" in subfolder "Documentation"
+    if (usb_buf->SendZLP)
+    {
+        usb_buf->SendZLP = false;
+
+        // Send ZLP
+        // A ZLP is a USB packet that contains no data payload. It's length is zero.
+        // ZLP's are important to signal the end of a data transfer when the last packet sent
+        // is exactly the maximum packet size (EP_DATA_PACKET_SIZE).
+        // Otherwise, if the last packet in a transfer is exactly wMaxPacketSize, the host could not know if more data will follow.
+        // If the ZLP is missing the host will expect another packet to come. To test this send a debug message with 62 characters.
+        USBD_LL_Transmit(&GLB_UsbDevice, epnum, NULL, 0);
+    }
+    else
+    {
+        buf_release_in_flight(channel);
+    }
+    return USBD_OK;
+}
+

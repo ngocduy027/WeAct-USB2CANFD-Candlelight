@@ -1,0 +1,12 @@
+Build_*/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.vscode/
+.idea/
+local/
+.env
+.env.*
+*.swp
+*~
+.DS_Store

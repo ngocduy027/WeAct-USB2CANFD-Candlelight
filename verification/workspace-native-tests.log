@@ -1,0 +1,30 @@
+test_incremental_build (test_build.BuildDependencies.test_incremental_build) ... ok
+test_error_handle_stop_and_recovery_intent (test_can_recovery.CanRecovery.test_error_handle_stop_and_recovery_intent) ... ok
+test_command_ownership_and_status (test_control.DeferredControl.test_command_ownership_and_status) ... ok
+test_unconfigured_out_setup_never_stages_or_acknowledges_commands (test_control.DeferredControl.test_unconfigured_out_setup_never_stages_or_acknowledges_commands) ... ok
+test_full_pool_preserves_busoff_and_recovery (test_errors.ErrorReports.test_full_pool_preserves_busoff_and_recovery) ... ok
+test_reserved_pages_and_write_failures (test_flash.FlashBounds.test_reserved_pages_and_write_failures) ... ok
+test_wire_records_and_padding (test_frame_codec.FrameCodec.test_wire_records_and_padding) ... ok
+test_inactive_or_error_session_acknowledges_all_enabled_sources (test_interrupts.InterruptOwnership.test_inactive_or_error_session_acknowledges_all_enabled_sources) ... ok
+test_only_candlelight_enables_fdcan_nvic_lines (test_interrupts.InterruptOwnership.test_only_candlelight_enables_fdcan_nvic_lines) ... ok
+test_other_boards_keep_existing_status_and_identify_behavior (test_led.LedPolicy.test_other_boards_keep_existing_status_and_identify_behavior) ... ok
+test_same_day_revision_keeps_usb_year_month (test_led.LedPolicy.test_same_day_revision_keeps_usb_year_month) ... ok
+test_weact_traffic_ready_close_suspend_and_tick_wrap (test_led.LedPolicy.test_weact_traffic_ready_close_suspend_and_tick_wrap) ... ok
+test_bulk_packets_cannot_overwrite_destination (test_regressions.TransportRegression.test_bulk_packets_cannot_overwrite_destination) ... ok
+test_ep0_rejects_incomplete_and_oversized_packets (test_regressions.TransportRegression.test_ep0_rejects_incomplete_and_oversized_packets) ... ok
+test_string_descriptor_bounds (test_regressions.TransportRegression.test_string_descriptor_bounds) ... ok
+test_dfu_defer_reset_and_rom_vectors (test_runtime.RuntimeRecovery.test_dfu_defer_reset_and_rom_vectors) ... ok
+test_retained_fault_and_watchdog_initialization (test_runtime.RuntimeRecovery.test_retained_fault_and_watchdog_initialization) ... ok
+test_busload_uses_wide_math_and_actual_duration (test_timing.Timing.test_busload_uses_wide_math_and_actual_duration) ... ok
+test_fd_mode_and_sjw_validation (test_timing.Timing.test_fd_mode_and_sjw_validation) ... ok
+test_timestamp_wrap_and_pending_update (test_timing.Timing.test_timestamp_wrap_and_pending_update) ... ok
+test_completion_cancel_backpressure_and_pool_conservation (test_tx.TxOwnership.test_completion_cancel_backpressure_and_pool_conservation) ... ok
+test_backpressure_clear_halt_and_reset (test_usb_lifecycle.UsbLifecycle.test_backpressure_clear_halt_and_reset) ... ok
+test_endpoint_and_interface_validation (test_usb_requests.UsbRequests.test_endpoint_and_interface_validation) ... ok
+test_interface_reset_maps_all_can_interfaces_and_skips_dfu (test_usb_requests.UsbRequests.test_interface_reset_maps_all_can_interfaces_and_skips_dfu) ... ok
+test_microsoft_request_uses_fresh_ep0_state (test_usb_requests.UsbRequests.test_microsoft_request_uses_fresh_ep0_state) ... ok
+
+----------------------------------------------------------------------
+Ran 25 tests in 5.573s
+
+OK

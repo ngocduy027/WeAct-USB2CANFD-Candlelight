@@ -1,0 +1,15 @@
+test_changed_user_page_is_failure (test_tools.DfuGuards.test_changed_user_page_is_failure) ... Full backup and restore script saved: /tmp/tmpr8fvcvwq
+ok
+test_full_backup_precedes_programming_and_restore_is_guarded (test_tools.DfuGuards.test_full_backup_precedes_programming_and_restore_is_guarded) ... Full backup and restore script saved: /tmp/tmp_ul5t58h
+ok
+test_readback_requires_image_and_every_reserved_byte (test_tools.DfuGuards.test_readback_requires_image_and_every_reserved_byte) ... ok
+test_short_backup_never_programs (test_tools.DfuGuards.test_short_backup_never_programs) ... ok
+test_target_requires_exact_serial_capacity_and_unique_path (test_tools.DfuGuards.test_target_requires_exact_serial_capacity_and_unique_path) ... ok
+test_bundled_release_verifies (test_tools.ReleaseChecks.test_bundled_release_verifies) ... ok
+test_hex_matches_bytes_and_rejects_corruption (test_tools.ReleaseChecks.test_hex_matches_bytes_and_rejects_corruption) ... ok
+test_manifest_rejects_changes_empty_and_escape (test_tools.ReleaseChecks.test_manifest_rejects_changes_empty_and_escape) ... ok
+
+----------------------------------------------------------------------
+Ran 8 tests in 0.022s
+
+OK
